@@ -1,0 +1,8 @@
+#!/bin/bash
+# A simple wrapper for flutter tool
+#
+# Author: Damian Wrobel <dwrobel@ertelnet.rybnik.pl>
+#
+# This file has been generated automatically.
+
+exec @FLUTTER_INVOKER@ "$@"

@@ -1,0 +1,93 @@
+OVERVIEW
+--------
+
+These tools build OCI _(podman/docker compatible)_ image which can be used
+for flutter application compilation for CPE _(target platform)_.
+
+
+CREATING IMAGE
+--------------
+
+1. Setup build environment
+
+  # On CentOS-7 switch default gcc to 7.x from https://www.softwarecollections.org/en/scls/rhscl/devtoolset-7/
+  [ -f /opt/rh/devtoolset-7/enable ] && source /opt/rh/devtoolset-7/enable
+  # Install 'repo' tool from: https://android.googlesource.com/tools/repo
+  repo init -u https://github.com/stagingrdkm/lgpub/ -m manifests/dac-dunfell-3.1.6-manifest.xml
+  repo sync -v -j$(getconf _NPROCESSORS_ONLN)
+  . ./oe-init-build-env
+  cp ../.repo/manifests/manifests/bblayers.conf conf/
+  echo 'INHERIT_remove = "uninative"' >> conf/local.conf
+  echo 'MACHINE = "raspberrypi4"' >> conf/local.conf
+
+2. The FLUTTER_ENGINE_RUNTIME_MODE variables need to be set in
+   the conf/local.conf configuration file.
+
+  # Use one of the following (mutually exclusive) mode:
+  FLUTTER_ENGINE_RUNTIME_MODE="release"
+  FLUTTER_ENGINE_RUNTIME_MODE="profile"
+
+3. Build an image
+
+  bitbake flutter-minimal-image
+
+4. Create an OCI _(podman/docker compatible)_ image
+
+  In meta-lgi-flutter/recipes-devtools/flutter-sdk/files/ directory execute:
+
+  make image
+
+5. Having a build of an engine in a profile mode, allows you to build the next
+  in a release mode and combine both of them into one OCI image. To do this, repeat
+  steps 2 to 3 using a different `FLUTTER_ENGINE_RUNTIME_MODE` comparing to
+  the provious one _(the order of release/profile build does not matter)_.
+  Finally use `BASE_IMAGE` parameter, and pass there the image you have
+  made previously:
+
+  make BASE_IMAGE=<tag-from-the-previous-image> image
+
+USAGE
+-----
+
+Run it with:
+
+  flutter-wrapper.sh bash
+
+Clone flutter application
+
+  git clone https://github.com/kevmoo/slide_puzzle.git
+
+Compile it
+
+  cd slide_puzzle
+  /sdk/flutter/bin/flutter-bundler
+
+You can also use it in a batch mode by specifying a command to be executed in a container:
+
+  git clone https://github.com/kevmoo/slide_puzzle.git
+  (cd slide_puzzle && flutter-wrapper.sh /sdk/flutter/bin/flutter-bundler)
+
+Run in on a target platform
+
+ - Compiled application is in build/arm-rdk-linux-gnueabi directory. Transfer it to the target platform and run.
+
+Create and launch dart application in AOT mode
+
+ - on CPE
+
+   dart /sdk/engine/src/out/linux_release_x64/dart-sdk/bin/snapshots/gen_kernel.dart.snapshot \
+               --platform /sdk/engine/src/out/linux_release_x64/dart-sdk/lib/_internal/vm_platform_strong_product.dill \
+               --aot \
+               -Ddart.vm.product=true \
+               -o <tmp>/kernel.dill \
+               <source>.dart
+
+   /sdk/engine/src/out/linux_release_x64/gen_snapshot --snapshot-kind=app-aot-elf \
+               --elf=<tmp>/snapshot.aot \
+               <tmp>/kernel.dill
+
+   Upload snapshot.aot and dart_precompiled_runtime_product (/sdk/engine/src/out/linux_release_arm/dart-sdk/bin/dart_precompiled_runtime_product)
+   to CPE and run:
+
+   dart_precompiled_runtime_product snapshot.aot
+

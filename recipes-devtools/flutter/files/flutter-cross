@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+#
+# Flutter AOT cross generator
+#
+# Author: Damian Wrobel <dwrobel@ertelnet.rybnik.pl>
+#
+
+set -e
+set -x
+
+function follow_links() (
+  cd -P "$(dirname -- "$1")"
+  file="$PWD/$(basename -- "$1")"
+  while [[ -h "$file" ]]; do
+    cd -P "$(dirname -- "$file")"
+    file="$(readlink -- "$file")"
+    cd -P "$(dirname -- "$file")"
+    file="$PWD/$(basename -- "$file")"
+  done
+  echo "$file"
+)
+
+function parse_yaml {
+   local prefix=$2
+   local s='[[:space:]]*' w='[a-zA-Z0-9_]*' fs=$(echo @|tr @ '\034')
+   sed  -e "s/\r//" \
+       -ne "s|^\($s\):|\1|" \
+        -e "s|^\($s\)\($w\)$s:$s[\"']\(.*\)[\"']$s\$|\1$fs\2$fs\3|p" \
+        -e "s|^\($s\)\($w\)$s:$s\(.*\)$s\$|\1$fs\2$fs\3|p"  $1 |
+   awk -F$fs '{
+      indent = length($1)/2;
+      vname[indent] = $2;
+      for (i in vname) {if (i > indent) {delete vname[i]}}
+      if (length($3) > 0) {
+         vn=""; for (i=0; i<indent; i++) {vn=(vn)(vname[i])("_")}
+         printf("%s%s%s %s\n", "'$prefix'",vn, $2, $3);
+      }
+   }'
+}
+
+flutter_aot_generate_app_dill() {
+    ${FLUTTER_ENGINE_OUT_DIR}/dart-sdk/bin/dart                 \
+    --disable-dart-dev                                          \
+    ${FLUTTER_ENGINE_OUT_DIR}/gen/frontend_server.dart.snapshot \
+    --sdk-root ${FLUTTER_ENGINE_OUT_DIR}/flutter_patched_sdk/   \
+    --target=flutter                                            \
+    --no-print-incremental-dependencies                         \
+    -Ddart.vm.profile=${VM_PROFILE}                             \
+    -Ddart.vm.product=${VM_PRODUCT}                             \
+    ${DART_MINUS_DS[@]}                                         \
+    --aot                                                       \
+    --tfa                                                       \
+    --packages .packages                                        \
+    --output-dill build/tmp/app.dill                            \
+    --depfile build/kernel_snapshot.d                           \
+    package:${FLUTTER_PACKAGE}
+}
+
+
+flutter_aot_generate_app_so() {
+    ${STAGING_BINDIR_NATIVE}/gen_snapshot                       \
+    --deterministic                                             \
+    --snapshot_kind=app-aot-elf                                 \
+    "${GEN_SNAPSHOT_FLAGS[@]}"                                  \
+    --elf=build/lib/libapp.so                                   \
+    build/tmp/app.dill
+}
+
+
+flutter_do_compile() {
+    echo "[1/4] building bundle"
+    (cd ${S} && flutter --local-engine=${LOCAL_ENGINE} build bundle --target="lib/${DART_MAIN}" --${RUNTIME_MODE} --no-tree-shake-icons -v)
+    (cd ${S} && mkdir -p build/tmp/ build/lib)
+    echo "[2/4] generating app.dill"
+    (cd ${S} && flutter_aot_generate_app_dill)
+    echo "[3/4] generating libapp.so"
+    (cd ${S} && flutter_aot_generate_app_so)
+    echo "[4/4] finished"
+}
+
+
+DART_MINUS_DS=()
+DART_ARGS=()
+DART_MAIN=main.dart
+RUNTIME_MODE="release"
+GEN_SNAPSHOT_FLAGS=()
+DEBUGGING_INFO_DIR=''
+OBFUSCATE=0
+
+for arg in "$@"; do
+  case ${arg} in
+    --dart-define=*)
+      DART_MINUS_DS+=" -D${arg#*=}"
+    ;;
+    --target=*)
+      DART_MAIN="$(basename ${arg#*=})"
+    ;;
+    --profile|--release)
+      RUNTIME_MODE="${arg:2}"
+      ;;
+    --obfuscate)
+      OBFUSCATE=1
+      ;;
+    --split-debug-info=*)
+      DEBUGGING_INFO_DIR=${arg#*=}
+    ;;
+    *)
+      ARGS+=" ${arg}"
+    ;;
+  esac
+done
+
+PROG_NAME="$(follow_links "${BASH_SOURCE[0]}")"
+BIN_DIR="$(cd "${PROG_NAME%/*}" ; pwd -P)"
+OS="$(uname -s)"
+
+if [ "${RUNTIME_MODE}" = "profile" ]; then
+ VM_PROFILE=true
+ VM_PRODUCT=false
+else
+ VM_PROFILE=false
+ VM_PRODUCT=true
+fi
+
+# Setup environment for flutter_do_compile()
+S=${PWD}
+LOCAL_ENGINE=linux_${RUNTIME_MODE}_x64
+STAGING_BINDIR_NATIVE=${BIN_DIR}/../../engine/src/out/${LOCAL_ENGINE}
+FLUTTER_ENGINE_OUT_DIR=${STAGING_BINDIR_NATIVE}
+FLUTTER_PACKAGE=$(parse_yaml pubspec.yaml "pubspec_" | grep "name" | cut -d ' ' -f 2-)
+FLUTTER_PACKAGE="${FLUTTER_PACKAGE}/${DART_MAIN}"
+
+export PATH=${BIN_DIR}:${PATH}
+
+if [ $OBFUSCATE -ne 0 ]; then
+  GEN_SNAPSHOT_FLAGS+=(--obfuscate)
+  if [ -z "$DEBUGGING_INFO_DIR" ]; then
+    printf '"--obfuscate" can only be used in combination with "--split-debug-info"\n' >&2
+    exit 1
+  fi
+fi
+if [ -n "$DEBUGGING_INFO_DIR" ]; then
+  (cd ${S} && mkdir -p "${DEBUGGING_INFO_DIR}")
+  GEN_SNAPSHOT_FLAGS+=(--dwarf-stack-traces)
+  GEN_SNAPSHOT_FLAGS+=(--save-debugging-info="${DEBUGGING_INFO_DIR}"/app.vm_snapshot.symbols)
+fi
+
+flutter_do_compile

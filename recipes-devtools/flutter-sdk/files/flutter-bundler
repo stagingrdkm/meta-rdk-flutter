@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+#
+# Flutter bundle generator for wayland launcher
+#
+# Author: Damian Wrobel <dwrobel@ertelnet.rybnik.pl>
+#
+
+set -e
+set -x
+
+
+function follow_links() (
+  cd -P "$(dirname -- "$1")"
+  file="$PWD/$(basename -- "$1")"
+  while [[ -h "$file" ]]; do
+    cd -P "$(dirname -- "$file")"
+    file="$(readlink -- "$file")"
+    cd -P "$(dirname -- "$file")"
+    file="$PWD/$(basename -- "$file")"
+  done
+  echo "$file"
+)
+
+
+function parse_yaml {
+   local prefix=$2
+   local s='[[:space:]]*' w='[a-zA-Z0-9_]*' fs=$(echo @|tr @ '\034')
+   sed  -e "s/\r//" \
+       -ne "s|^\($s\):|\1|" \
+        -e "s|^\($s\)\($w\)$s:$s[\"']\(.*\)[\"']$s\$|\1$fs\2$fs\3|p" \
+        -e "s|^\($s\)\($w\)$s:$s\(.*\)$s\$|\1$fs\2$fs\3|p"  $1 |
+   awk -F$fs '{
+      indent = length($1)/2;
+      vname[indent] = $2;
+      for (i in vname) {if (i > indent) {delete vname[i]}}
+      if (length($3) > 0) {
+         vn=""; for (i=0; i<indent; i++) {vn=(vn)(vname[i])("_")}
+         printf("%s%s%s %s\n", "'$prefix'",vn, $2, $3);
+      }
+   }'
+}
+
+
+flutter_do_tar() {
+  echo "PWD: $PWD"
+  tmpdir=$(mktemp -d)
+  appdir="${tmpdir}/usr/share/flutter/apps/flutter-wayland-app/data"
+  mkdir -p "${appdir}"
+  (cd build && rsync -av --exclude isolate_snapshot_data --exclude kernel_blob.bin --exclude vm_snapshot_data flutter_assets "${appdir}")
+  (cd build && rsync -av lib "${appdir}/..")
+  tar -cf ${BIN_DIR}/../../../flutter-wayland-app/files/flutter-wayland-app.tar -C "${tmpdir}" .
+  rm -rf ${tmpdir}
+}
+
+flutter_unpack_archive() {
+    file_full_path=$1
+    destdir=$2
+
+    mime_type=$(file --mime-type "${file_full_path}" | cut -d ' ' -f2-)
+
+    echo "Unpacking: ${file_full_path} mime-type: ${mime_type}"
+
+    case "${mime_type}" in
+        "application/vnd.debian.binary-package")
+            local tmpdir=$(mktemp -d);
+            (cd "${tmpdir}"; ar -x "${file_full_path}" data.tar.gz) && tar zxf "${tmpdir}/data.tar.gz" -C "${destdir}"
+            rm -rf "${tmpdir}"
+    ;;
+    "application/x-rpm")
+            rpm2cpio "${file_full_path}" | cpio -idmv -D "${destdir}"
+    ;;
+    "application/x-tar")
+        tar --no-same-owner  -xf "${file_full_path}" -C "${destdir}"
+    ;;
+    "application/gzip")
+        tar --no-same-owner -zxf "${file_full_path}" -C "${destdir}"
+    ;;
+    "application/x-bzip2")
+        tar --no-same-owner -jxf "${file_full_path}" -C "${destdir}"
+    ;;
+    "application/x-xz")
+        tar --no-same-owner -Jxf "${file_full_path}" -C "${destdir}"
+    ;;
+    *)
+        echo "Unsupported mime-type: ${mime_type}"
+        exit 2
+    ;;
+    esac
+}
+
+flutter_do_bundle() {
+    echo "PWD: $PWD"
+    local appdir="${BIN_DIR}/../../../flutter-wayland-app/files/${SDK_TYPE}"
+
+    echo "Recreate output directory"
+    rm -rf ${S}/build/${TARGET}
+    mkdir -p ${S}/build/${TARGET}/
+
+    echo "Install data sub-directory"
+    mkdir -p ${S}/build/${TARGET}/data
+    cp -a ${S}/build/flutter_assets ${S}/build/${TARGET}/data/
+
+    echo "Install icudtl.dat"
+    install -p -m 0644 -D ${appdir}/usr/share/flutter/icudtl.dat ${S}/build/${TARGET}/data/icudtl.dat
+
+    echo "Install libapp.so"
+    install -p -m 0755 -D ${S}/build/lib/libapp.so  ${S}/build/${TARGET}/lib/libapp.so
+
+    echo "Install libflutter_engine.so library"
+    install -p -m 0755 -D ${appdir}/usr/lib/libflutter_engine.so ${S}/build/${TARGET}/lib/libflutter_engine.so
+
+    echo "Install flutter-launcher-wayland"
+    install -p -m 0755 -D ${appdir}/usr/bin/flutter-launcher-wayland ${S}/build/${TARGET}/flutter-launcher-wayland
+}
+
+
+flutter_do_build() {
+  ${TARGET}-flutter "$@"
+}
+
+
+flutter_find_target() {
+    local target=$(basename $(find ${BIN_DIR}/ -name "*-flutter"))
+
+    if [ "x${target}" = "x" ];then
+       echo "ERROR: Could not determine target platform"
+       exit 2
+    fi
+
+    TARGET=${target%-flutter}
+}
+
+
+flutter_generate_launcher() {
+    local launcher_name=$1
+
+    cat > ${S}/build/${TARGET}/${launcher_name} <<- 'EOD'
+	#!/bin/sh
+	
+	SCRIPT_DIR=$(cd `dirname $0` && pwd)
+	
+	# BCM Nexus specific
+	if [ -f /usr/bin/weston.exports.inc ]; then
+		source /usr/bin/weston.exports.inc
+	fi
+
+	if [ ! -d ${HOME} ]; then
+		echo 'warning: $HOME does not point to existing directory, setting to /tmp'
+		export HOME=/tmp
+	fi
+
+	if [ -z ${LANG+x} ]; then
+		echo 'warning: $LANG empty, setting to C'
+		export LANG=C
+	fi
+
+	export LD_PRELOAD=$WAYLAND_PLATFORM_LD_PRELOADS
+	export nexus_ipc_dir=/var/run/nxserver
+	export DBUS_SESSION_BUS_ADDRESS=unix:path=/var/run/dbus/system_bus_socket
+
+	if [ -z ${WAYLAND_DISPLAY+x} ]; then
+		export WAYLAND_DISPLAY=wayland-0
+	fi
+
+	if [ -z ${XDG_RUNTIME_DIR+x} ]; then
+		export XDG_RUNTIME_DIR=/run/
+	fi
+
+	export LD_LIBRARY_PATH=${SCRIPT_DIR}/lib:${LD_LIBRARY_PATH}
+
+	if [ ! -f /usr/lib/libEGL.so.1 ]; then
+		if [ ! -L ${SCRIPT_DIR}/lib/libEGL.so.1 ]; then
+			ln -sf /usr/lib/libEGL.so ${SCRIPT_DIR}/lib/libEGL.so.1
+		fi
+	fi
+
+	# Workaround for RDK raspberry pi
+	if [ ! -f /usr/lib/libwayland-egl.so.1 ]; then
+		if [ ! -L ${SCRIPT_DIR}/lib/libwayland-egl.so.1 ]; then
+			ln -sf /usr/lib/libwayland-egl.so ${SCRIPT_DIR}/lib/libwayland-egl.so.1
+		fi
+
+		export LD_PRELOAD=${LD_PRELOAD}:/usr/lib/libGLESv2.so.2:/usr/lib/libwayland-client.so.0:/usr/lib/libwayland-egl.so:/usr/lib/libopenmaxil.so
+	fi
+
+	exec ${SCRIPT_DIR}/flutter-launcher-wayland ${SCRIPT_DIR}/data/flutter_assets "$@"
+	EOD
+
+    chmod a+x ${S}/build/${TARGET}/${launcher_name}
+}
+
+
+flutter_do_sanity() {
+    local pub_spec_file=${S}/pubspec.yaml
+
+    if [ ! -f ${pub_spec_file} ]; then
+        echo "ERROR: Could not find: ${pub_spec_file}."
+        echo "INFO: Run it in the main project directory, where the pubspce.yaml is located."
+        exit 2
+  fi
+}
+
+
+PROG_NAME="$(follow_links "${BASH_SOURCE[0]}")"
+BIN_DIR="$(cd "${PROG_NAME%/*}" ; pwd -P)"
+OS="$(uname -s)"
+
+# Setup environment
+S=$PWD
+FLUTTER_PACKAGE=$(parse_yaml pubspec.yaml "pubspec_" | grep "name" | cut -d ' ' -f 2-)
+SDK_TYPE="release"
+
+for opt in "$@"
+do
+    if [ "${opt}" = "--profile" ]  || [ "${opt}" = "--release" ]; then
+        SDK_TYPE=${opt:2}
+        break
+    fi
+done
+
+export PATH=${BIN_DIR}:$PATH
+
+flutter_do_sanity
+flutter_find_target
+flutter_do_build "$@"
+flutter_do_bundle
+flutter_generate_launcher ${FLUTTER_PACKAGE}
